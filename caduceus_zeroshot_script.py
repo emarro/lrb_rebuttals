@@ -212,6 +212,21 @@ if __name__ == "__main__":
         default=1,
         help="The size of the batch for each forward pass",
     )
+    
+    parser.add_argument(
+        "--shards",
+        type=int,
+        default=None,
+        help="The number of shards to split the dataset up into",
+    )
+
+    parser.add_argument(
+        "--rank",
+        type=int,
+        default=None,
+        help="The rank (shard_idx) of this process",
+    )
+
 
     args = parser.parse_args()
 
@@ -228,15 +243,23 @@ if __name__ == "__main__":
     sequence_length = args.sequence_length
     datasets.enable_caching()
     cache_ds = task_name+"_"+str(sequence_length)+".arrow"
+    shards = args.shards
+    rank = args.rank
+    if shards is not None and rank is not None:
+        cache_ds = task_name+"_"+str(sequence_length)+"_" +str(rank) + ".arrow"
     accelerator = Accelerator()
     batch_size = args.batch_size 
     if not os.path.exists(cache_ds) and accelerator.is_main_process:
         dataset = load_lrb_dataset(sequence_length=sequence_length, task_name=task_name)
+        if shards is not None and rank is not None:
+            dataset = dataset.shard(num_shards=shards, index=rank)
+            task_name = task_name+"_"+str(rank)
+
         #dataset = split_dataset_by_node(dataset=dataset, rank=accelerator.local_process_index, world_size=accelerator.num_processes)
         print(dataset)
         dataset = dataset.map(lambda x: tokenizer(x["ref_forward_sequence"]), batched=True, batch_size=256)
         dataset = dataset.map(
-            lambda x: {"chromosome": list(map(chr_to_int, x["chromosome"]))}, batched=True
+            lambda x: {"chromosome": list(map(chr_to_int, x["chromosome"]))}, batched=True, batch_size=256
         )
         dataset = dataset.map(
             lambda x: {
