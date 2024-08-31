@@ -5,7 +5,7 @@ import torch
 from torch.utils.data import DataLoader
 from datasets import load_dataset, load_from_disk 
 from datasets.distributed import split_dataset_by_node
-from accelerate import Accelerator
+from accelerate import Accelerator, cpu_offload, dispatch_model, infer_auto_device_map
 from sklearn.metrics import average_precision_score, roc_auc_score
 from tqdm import tqdm
 from transformers import (
@@ -19,16 +19,24 @@ from transformers import (
 def load_model_and_tokenizer(model_name):
     # model_name = "kuleshov-group/caduceus-ps_seqlen-131k_d_model-256_n_layer-16"
     tokenizer = AutoTokenizer.from_pretrained(
-        model_name, trust_remote_code=True, revision="main"
+        model_name, trust_remote_code=True, revision="1.1_fix"
     )
     model_config = AutoConfig.from_pretrained(
-        model_name, trust_remote_code=True, revision="main"
+        model_name, trust_remote_code=True, revision="1.1_fix"
     )
+    model_config.inference_mode = True
 
-    model = AutoModelForMaskedLM.from_pretrained(
-        model_name, config=model_config, trust_remote_code=True, revision="main"
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name, config=model_config, trust_remote_code=True, revision="1.1_fix"#, device_map='auto'
     )
-    model = model
+    #model = model.cuda()
+    #model = dispatch_model(model)
+    mem_map = infer_auto_device_map(model, max_memory={x: "3.75GB" for x in range(4)}, no_split_module_classes=['ParallelGatedConvBlock', 'AttentionBlock'], dtype=torch.bfloat16)
+    mem_map['backbone.unembed.weight'] = 1
+    print(mem_map)
+    #print(model)
+    model = dispatch_model(model, mem_map)
+    #model = cpu_offload(model)
     return model, tokenizer
 
 def chr_to_int(chromosome):
@@ -76,32 +84,70 @@ def load_lrb_dataset(sequence_length, task_name):
 
 # %%
 @torch.no_grad()
-def calc_ar_zeroshot(model, tokenizer, batched_data):
+def calc_ar_zeroshot(model_name, model, tokenizer, batched_data, batch_size):
     """
-    Calcuclate zero-shot pred for a single variant using a autoregressive model
+    Calcuclate zero-shot pred for a single variant for a bert style model (e.g. caduceus)
     """
-    raise NotImplementedError()
-    ref = tokenizer(batched_data["ref_forward_sequence"])  # [3, batch, seq_len]
-    ref_ids = torch.Tensor(ref["input_ids"]).int()  # [batch, seq_len]
-    ref_attn_mask = ref["attention_mask"]  # [batch, seq_len]
+    #Get sequence input ids
+    ref_ids = batched_data["input_ids"].long()  # [batch, seq_len]
+    batch_size, seq_len = ref_ids.shape
+    alt_ids = batched_data["alt_input_ids"].long()  # [batch, seq_len]
 
-    alt = tokenizer(batched_data["alt_forward_sequence"])  # [3, batch, seq_len]
-    alt_ids = torch.Tensor(alt["input_ids"]).int()  # [batch, seq_len]
-    alt_attn_mask = alt["attention_mask"]  # [batch, seq_len]
+    batch_size, seq_len = ref_ids.size()
 
-    variant_pos = torch.Tensor(
-        [1024 for _ in range(ref_ids.size(0))]
-    ).int()  # batched_data['position'] # [batch]
-    ref_token = ref_ids[:, variant_pos]  # [batch]
-    alt_token = alt_ids[:, variant_pos]  # [batch]
+    # assume the variant of interest is in the middle of the sequence
+    mask_location = seq_len // 2
+    #print(ref_ids[0, mask_location-2:mask_location+2])
+    #print(alt_ids[0, mask_location-2:mask_location+2])
 
-    probs = model(input_ids=ref_ids)  # [batch, seq_len, vocab_size]
-    return probs
+    #find the ref and alt tokens for each batch
+    ref_token = torch.clone(ref_ids[:, mask_location]).detach()  # [batch]
+    alt_token = torch.clone(alt_ids[:, mask_location]).detach()  # [batch]
 
-    ref_probs = probs[:, variant_pos, ref_token]  # [batch]
-    alt_probs = probs[:, variant_pos, alt_token]  # [batch]
-    return (ref_probs / alt_probs).log()  # [batch]
+    #make sure our mask_location makes sense
+    assert (
+        ref_ids[0, mask_location].item() != alt_ids[0, mask_location].item()
+    ), f"The ref and alternate sequence have the same token at {mask_location}, the masking location is likely incorrect."
 
+    # mask out the position of the variant of interest
+    #ref_ids[:, mask_location] = tokenizer.mask_token_id
+    ref_ids = ref_ids.long()
+
+    #alt_ids[:, mask_location] = tokenizer.mask_token_id
+    alt_ids = alt_ids.long()
+    assert ref_token[0] != alt_token[0], f"Ref token {ref_token[0]} and alt token {alt_token[0]} are the same when they should be different"
+    ref_ids = ref_ids[: mask_location] #[batch, mask_location-1]
+
+
+    # Forward pass
+    probs = model(input_ids=ref_ids.cuda())["logits"].softmax(
+        dim=-1
+    ).cpu()  # [batch, seq_len, vocab_size]
+    #print(probs)
+
+    # select P_ref and P_alt
+    ref_probs = []
+    alt_probs = []
+    for b_idx in range(batch_size):
+        ref_prob = probs[b_idx, mask_location-1, ref_token[b_idx]]  # [1]
+        ref_probs.append(ref_prob)
+        alt_prob = probs[b_idx, mask_location-1, alt_token[b_idx]]  # [1]
+        alt_probs.append(alt_prob)
+    ref_probs = torch.stack(ref_probs, dim=0)  # [batch]
+    alt_probs = torch.stack(alt_probs, dim=0)  # [batch]
+    #print(ref_token)
+    #print(alt_token)
+    #print(ref_probs)
+    #print(alt_probs)
+
+    labels = batched_data["label"]  # [batch]
+
+    #return the variant effect score
+    score = (
+        ref_probs / alt_probs
+    ).log()
+    #print(score)
+    return score, labels  # ([batch], [batch]) == (y_score, y_true)
 
 # %%
 @torch.no_grad()
@@ -184,7 +230,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model_name",
         type=str,
-        required=True,
+        default='togethercomputer/evo-1-131k-base',
         help="The HF model name to load. e.g.: (kuleshov-group/caduceus-ps_seqlen-131k_d_model-256_n_layer-16), (kuleshov-group/caduceus-ph_seqlen-131k_d_model-256_n_layer-16), (kuleshov-group/caduceus-ps_seqlen-1k_d_model-256_n_layer-4_lr-8e-3), (kuleshov-group/caduceus-ph_seqlen-1k_d_model-256_n_layer-4_lr-8e-3) ",
     )
     zero_shot_tasks = [
@@ -242,7 +288,7 @@ if __name__ == "__main__":
     task_name = args.task_name
     sequence_length = args.sequence_length
     datasets.enable_caching()
-    cache_ds = task_name+"_"+str(sequence_length)+".arrow"
+    cache_ds = task_name+"_"+str(sequence_length)+"_evo.arrow"
     shards = args.shards
     rank = args.rank
     if shards is not None and rank is not None:
@@ -280,13 +326,14 @@ if __name__ == "__main__":
 
     
 
-    (model, dl) = accelerator.prepare(model, dl)
+    #(model, dl) = accelerator.prepare(model, dl)
+    dl = accelerator.prepare(dl)
 
     out_agg, label_agg = [], []
     for data in tqdm(dl):
-        with accelerator.no_sync(model):
-            with accelerator.autocast():
-                out, label = calc_mlm_zeroshot(model_name, model, tokenizer, data, batch_size=batch_size)
+        #with accelerator.no_sync(model):
+        #    with accelerator.autocast():
+        out, label = calc_ar_zeroshot(model_name, model, tokenizer, data, batch_size=batch_size)
         out_agg.append(out)
         label_agg.append(label)
     out_agg = accelerator.gather_for_metrics(out_agg)
@@ -306,16 +353,16 @@ if __name__ == "__main__":
         # Save the outputs of all the evaluated metrics and compute some performance metrics
 
         # %%
-        var_scores = torch.cat(out_agg, dim=0).cpu().detach()
+        var_scores = torch.cat(out_agg, dim=0).cpu().detach().float()
         print(f"Var scores shape {var_scores.shape}")
         scores_path = model_name.split("/")[1] + "_" + task_name + "_zero_shot_scores.pt"
         torch.save(var_scores, scores_path)
 
         # %%
-        var_labels = torch.cat(label_agg, dim=0).cpu().detach()
+        var_labels = torch.cat(label_agg, dim=0).cpu().detach().float()
         print(f"Var labels shape {var_labels.shape}")
         labels_path = model_name.split("/")[1] + "_" + task_name + "_zero_shot_labels.pt"
-        torch.save(var_scores, labels_path)
+        torch.save(var_labels, labels_path)
 
         # %%
         roc_auc = roc_auc_score(y_true=var_labels, y_score=var_scores)
